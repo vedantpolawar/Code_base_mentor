@@ -1,0 +1,33 @@
+{
+  "name": "codebase-mentor-backend",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "evaluate:agent-context": "node scripts/evaluate-agent-context-bridge.js",
+    "evaluate:workspace-agent-context": "node scripts/evaluate-workspace-agent-context.js",
+    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "test": "node --test test/*.test.js",
+    "check:llm": "node --env-file-if-exists=.env scripts/check-llm.js",
+    "verify:public": "node scripts/verify-public.js",
+    "verify:http": "node scripts/verify-http.js",
+    "verify:ui": "node scripts/verify-ui.js",
+    "verify:discussion": "node scripts/verify-discussion-ui.js",
+    "verify:pr": "node scripts/verify-pr.js",
+    "verify:pr-ui": "node scripts/verify-pr-ui.js",
+    "verify:handoffs": "node scripts/verify-handoffs-ui.js",
+    "verify:journeys": "node scripts/verify-journeys-ui.js",
+    "verify:practice": "node scripts/verify-practice-ui.js",
+    "verify:journey-runtime": "node scripts/verify-journey-runtime.js",
+    "seed:ide-demo": "node --env-file-if-exists=.env scripts/seed-ide-demo.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "tar-stream": "^3.1.7",
+    "typescript": "^5.9.3",
+    "zod": "^4.1.12"
+  }
+}

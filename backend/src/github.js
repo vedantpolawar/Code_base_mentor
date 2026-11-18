@@ -1,0 +1,284 @@
+import { gunzipSync } from "node:zlib";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import tar from "tar-stream";
+import { isSetupPath } from "./setupRequirements.js";
+const MAX_RESPONSE = 8 * 1024 * 1024;
+const MAX_ERROR_RESPONSE = 4096;
+// Bump when source selection, archive limits, or extraction semantics change.
+export const EXTRACTION_POLICY_VERSION = "1";
+
+async function readErrorResponse(response) {
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const chunks = [];
+  let size = 0;
+  while (size < MAX_ERROR_RESPONSE) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = value.subarray(0, MAX_ERROR_RESPONSE - size);
+    chunks.push(Buffer.from(chunk));
+    size += chunk.length;
+    if (chunk.length < value.length || size === MAX_ERROR_RESPONSE) {
+      await reader.cancel();
+      break;
+    }
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function githubErrorMessage(response, body, hostname) {
+  if (hostname !== "api.github.com") return null;
+  let message;
+  try {
+    const parsed = JSON.parse(body);
+    if (typeof parsed.message === "string")
+      message = parsed.message.replace(/\s+/g, " ").trim().slice(0, 500);
+  } catch {
+    return null;
+  }
+  const retryAfter = Number(response.headers.get("retry-after"));
+  const resetAt = Number(response.headers.get("x-ratelimit-reset"));
+  if (
+    response.status === 403 &&
+    (response.headers.get("x-ratelimit-remaining") === "0" ||
+      /rate limit exceeded|secondary rate limit/i.test(message || ""))
+  ) {
+    const retryTime =
+      Number.isFinite(retryAfter) && retryAfter > 0
+        ? ` Retry after approximately ${Math.ceil(retryAfter)} seconds.`
+        : Number.isFinite(resetAt) && resetAt > 0 && resetAt < 8640000000000
+          ? ` Retry after ${new Date(resetAt * 1000).toISOString()}.`
+          : "";
+    return `GitHub API rate limit exceeded.${retryTime} Configure or refresh GITHUB_TOKEN in backend/.env, restart the backend, or retry after the limit resets.`;
+  }
+  return message
+    ? `GitHub API returned ${response.status}: ${message}`
+    : `GitHub API returned ${response.status}`;
+}
+
+export async function boundedFetch(
+  url,
+  {
+    limit = MAX_RESPONSE,
+    binary = false,
+    headers = {},
+    timeoutMs = 30000,
+    ...options
+  } = {},
+) {
+  let response;
+  let current = new URL(url);
+  for (let redirects = 0; redirects <= 3; redirects++) {
+    try {
+      response = await fetch(current, {
+        ...options,
+        redirect: "manual",
+        signal: options.signal
+          ? AbortSignal.any([options.signal, AbortSignal.timeout(timeoutMs)])
+          : AbortSignal.timeout(timeoutMs),
+        headers,
+      });
+    } catch (error) {
+      const code = error.cause?.code || error.code;
+      if (code === "EACCES" || code === "EPERM") {
+        throw Object.assign(
+          new Error(
+            `Network access to ${current.hostname} was denied by the operating system (${code}). Restart the backend from a normal terminal outside the restricted environment: cd backend, then npm.cmd run dev. If access is still denied, check your firewall or proxy settings.${current.hostname === "api.github.com" ? " A GitHub token cannot fix this network permission error." : ""}`,
+          ),
+          { code },
+        );
+      }
+      throw Object.assign(
+        new Error(
+          `Cannot reach ${current.hostname}: ${error.cause?.code || error.message}. Check network access and retry.`,
+        ),
+        { code },
+      );
+    }
+    if (![301, 302, 307, 308].includes(response.status)) break;
+    const next = new URL(response.headers.get("location"), current);
+    await response.body?.cancel();
+    if (redirects === 3 || next.origin !== new URL(url).origin)
+      throw new Error(
+        "Remote redirect is outside the allowed origin or exceeds limits",
+      );
+    current = next;
+  }
+  if (!response.ok) {
+    const body = await readErrorResponse(response);
+    const githubMessage = githubErrorMessage(response, body, current.hostname);
+    const message =
+      githubMessage ||
+      `Remote request to ${current.hostname} failed (${response.status}). Check repository access, revision, or API rate limits.`;
+    throw Object.assign(new Error(message), {
+      remoteStatus: response.status,
+    });
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body) {
+    size += chunk.length;
+    if (size > limit) {
+      await response.body.cancel().catch(() => {});
+      throw new Error("Remote response exceeds analysis limits");
+    }
+    chunks.push(chunk);
+  }
+  const body = Buffer.concat(chunks);
+  return binary ? body : body.toString("utf8");
+}
+export function parseRepository(value) {
+  const match =
+    /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(value);
+  if (!match || match.slice(1).some((x) => x === "." || x === ".."))
+    throw new Error("Enter a public https://github.com/owner/repository URL");
+  return {
+    owner: match[1],
+    name: match[2],
+    url: `https://github.com/${match[1]}/${match[2]}`,
+  };
+}
+export async function resolveRepository(url, revision) {
+  const repo = parseRepository(url);
+  const headers = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "Codebase-Mentor",
+    ...(process.env.GITHUB_TOKEN
+      ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
+      : {}),
+  };
+  const api = `https://api.github.com/repos/${repo.owner}/${repo.name}`;
+  const get = async (endpoint) =>
+    JSON.parse(await boundedFetch(`${api}${endpoint}`, { headers }));
+  const metadata = await get("");
+  if (metadata.private !== false)
+    throw new Error("Only public repositories are supported");
+  const ref = revision || metadata.default_branch;
+  if (typeof ref !== "string" || !ref) throw new Error("Repository has no resolvable revision");
+  const commit = (
+    await get(
+      `/commits/${encodeURIComponent(ref)}`,
+    )
+  ).sha;
+  if (typeof commit !== "string" || !/^[a-f0-9]{40}$/i.test(commit))
+    throw new Error("GitHub returned an invalid immutable commit SHA");
+  return {
+    repository: repo.url, commit: commit.toLowerCase(),
+    branch: revision ? null : metadata.default_branch,
+    revision: ref,
+  };
+}
+export async function downloadRepository(url, revision, progress, resolved) {
+  const repo = parseRepository(url);
+  const pinned = resolved || await resolveRepository(url, revision);
+  if (pinned.repository !== repo.url || !/^[a-f0-9]{40}$/.test(pinned.commit))
+    throw new Error("Invalid pinned repository identity");
+  const { commit } = pinned;
+  const headers = {
+    Accept: "application/vnd.github+json", "User-Agent": "Codebase-Mentor",
+    ...(process.env.GITHUB_TOKEN ? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` } : {}),
+  };
+  const get = async (endpoint) => JSON.parse(await boundedFetch(
+    `https://api.github.com/repos/${repo.owner}/${repo.name}${endpoint}`, { headers },
+  ));
+  progress(15, `Resolved commit ${commit.slice(0, 12)}`);
+  const tree = await get(`/git/trees/${commit}?recursive=1`);
+  const exclusions = [];
+  const selected = [];
+  let total = 0;
+  for (const entry of tree.tree) {
+    if (entry.type !== "blob") continue;
+    const p = entry.path;
+    if (
+      entry.mode === "120000" ||
+      /(^|\/)(node_modules|dist|build|coverage|vendor|generated|\.git)(\/|$)|\.min\.[cm]?js$|\.d\.ts$|(^|\/)\.env|secret|credential|private.?key/i.test(
+        p,
+      )
+    ) {
+      exclusions.push({
+        path: p,
+        reason:
+          "Excluded dependency, generated output, symlink, or sensitive path",
+      });
+      continue;
+    }
+    if (
+      !/\.(?:[cm]?[jt]s|tsx|jsx)$|(^|\/)(package\.json|tsconfig\.json|README\.md)$/i.test(
+        p,
+      )
+    )
+      continue;
+    if (
+      entry.size > 256000 ||
+      selected.length >= 200 ||
+      total + entry.size > 5 * 1024 * 1024
+    ) {
+      exclusions.push({ path: p, reason: "File, count, or total byte limit" });
+      continue;
+    }
+    selected.push(entry);
+    total += entry.size;
+  }
+  if (tree.truncated)
+    exclusions.push({
+      path: "*",
+      reason: "GitHub tree was truncated; analysis is incomplete",
+    });
+  progress(25, "Downloading bounded source archive");
+  const compressed = await boundedFetch(
+    `https://codeload.github.com/${repo.owner}/${repo.name}/tar.gz/${commit}`,
+    { limit: 12 * 1024 * 1024, binary: true },
+  );
+  const archive = gunzipSync(compressed, { maxOutputLength: 32 * 1024 * 1024 });
+  const files = {},
+    wanted = new Set(selected.map((e) => e.path));
+  const extract = tar.extract();
+  extract.on("entry", (header, stream, next) => {
+    const p = header.name.split("/").slice(1).join("/");
+    if (!wanted.has(p) || header.type !== "file" || header.size > 256000) {
+      stream.resume();
+      stream.on("end", next);
+      return;
+    }
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => {
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (body.includes("\0"))
+        exclusions.push({ path: p, reason: "Binary content" });
+      else files[p] = body;
+      next();
+    });
+  });
+  await pipeline(Readable.from([archive]), extract);
+  for (const entry of selected)
+    if (
+      !Object.hasOwn(files, entry.path) &&
+      !exclusions.some((e) => e.path === entry.path)
+    )
+      exclusions.push({
+        path: entry.path,
+        reason: "Not a regular file in archive",
+      });
+  progress(
+    55,
+    `Loaded ${Object.keys(files).length} eligible files from commit archive`,
+  );
+  return {
+    ...pinned,
+    files,
+    exclusions,
+    complete: !tree.truncated && exclusions.every((entry) =>
+      entry.reason === "Excluded dependency, generated output, symlink, or sensitive path"),
+    setupMetadata: {
+      paths: tree.tree
+        .filter(
+          (e) =>
+            e.type === "blob" && e.mode !== "120000" && isSetupPath(e.path),
+        )
+        .map((e) => e.path),
+      limited: !!tree.truncated,
+    },
+  };
+}
